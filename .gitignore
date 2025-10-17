@@ -6,7 +6,6 @@ dist/
 
 # Env files
 .env
-.env.*
 
 # OS/editor
 .DS_Store

@@ -371,10 +371,164 @@ class ScanPowerMCPServer {
   }
 
   private loadOpenApiAndGenerateTools(): void {
-    const defaultSpecPath = process.env.SCANPOWER_OPENAPI_SPEC || '/Users/paulretherford/src/u2/wwwroot/docs/api/bundled.json';
+    const specSource = process.env.SCANPOWER_OPENAPI_SPEC;
+
+    const generateFromCurrentOpenApi = () => {
+      if (!this.openApi) {
+        this.generatedTools = [];
+        this.operationMap.clear();
+        return;
+      }
+
+      const tools: Tool[] = [];
+      const opMap: Map<string, any> = new Map();
+      const paths = this.openApi.paths || {};
+      const methods = ['get', 'post', 'put', 'delete', 'patch'];
+
+      for (const pathKey of Object.keys(paths)) {
+        const pathItem = paths[pathKey] || {};
+        for (const m of methods) {
+          const op = pathItem[m];
+          if (!op) continue;
+          const operationId = op.operationId || `${m}_${pathKey.replace(/[^a-zA-Z0-9]+/g, '_')}`;
+          const description = op.summary || op.description || `${m.toUpperCase()} ${pathKey}`;
+
+          // Collect parameters and resolve references
+          const rawParams = [...(pathItem.parameters || []), ...(op.parameters || [])];
+          const params = rawParams.map((p: any) => {
+            if (p.$ref) {
+              // Resolve reference
+              const refPath = p.$ref.replace('#/', '').split('/');
+              let resolved = this.openApi;
+              for (const part of refPath) {
+                resolved = resolved?.[part];
+              }
+              return resolved || p;
+            }
+            return p;
+          });
+          const pathParams = params.filter((p: any) => p.in === 'path').map((p: any) => p.name);
+          const queryParams = params.filter((p: any) => p.in === 'query').map((p: any) => p.name);
+          const headerParams = params.filter((p: any) => p.in === 'header').map((p: any) => p.name);
+          const paramDefsByIn: any = { path: [], query: [], header: [] };
+          for (const p of params) {
+            if (p.in === 'path') paramDefsByIn.path.push(p);
+            if (p.in === 'query') paramDefsByIn.query.push(p);
+            if (p.in === 'header') paramDefsByIn.header.push(p);
+          }
+
+          const inputSchemaProps: any = {};
+          for (const p of pathParams) inputSchemaProps[p.replace(/[-.]/g, '_')] = { type: 'string' };
+          for (const q of queryParams) inputSchemaProps[q.replace(/[-.]/g, '_')] = { type: ['string', 'number', 'boolean', 'array', 'object'] };
+          for (const h of headerParams) inputSchemaProps[h.replace(/[-.]/g, '_')] = { type: 'string' };
+
+          // Request body support (JSON only)
+          let requiresBody = false;
+          let bodySchema: any = undefined;
+          if (op.requestBody && op.requestBody.content) {
+            const contentTypes = Object.keys(op.requestBody.content);
+            if (contentTypes.includes('application/json')) {
+              requiresBody = true;
+              bodySchema = op.requestBody.content['application/json']?.schema;
+            }
+          }
+          if (requiresBody) {
+            inputSchemaProps['body'] = { type: ['object', 'array', 'string', 'number', 'boolean', 'null'] };
+          }
+
+          // Add api_token for auth convenience
+          inputSchemaProps['api_token'] = { type: 'string', description: 'Optional token for bearer/apiKey auth' };
+
+          const required: string[] = [];
+          // Path params are typically required
+          for (const p of pathParams) required.push(p.replace(/[-.]/g, '_'));
+
+          tools.push({
+            name: operationId,
+            description,
+            inputSchema: {
+              type: 'object',
+              properties: inputSchemaProps,
+              required: required.length ? required : undefined,
+            },
+          });
+
+          opMap.set(operationId, {
+            method: m.toUpperCase(),
+            path: pathKey,
+            pathParams,
+            queryParams,
+            headerParams,
+            paramDefs: paramDefsByIn,
+            security: op.security || this.openApi.security || [],
+            bodyRequired: requiresBody,
+            bodySchema,
+          });
+        }
+      }
+
+      this.generatedTools = tools;
+      this.operationMap = opMap;
+    };
+
+    // Check if specSource is a URL (http/https) or blob URL
+    if (/^https?:\/\//i.test(specSource) || /^blob:https?:\/\//i.test(specSource)) {
+      // Load asynchronously from URL
+      console.error(`Loading OpenAPI spec from URL: ${specSource}`);
+      this.openApi = null;
+      this.generatedTools = [];
+      this.operationMap.clear();
+      
+      // Skip blob URLs as they can't be fetched via HTTP
+      if (/^blob:https?:\/\//i.test(specSource)) {
+        console.error('Blob URLs cannot be fetched via HTTP. Please provide a direct HTTP/HTTPS URL to the OpenAPI spec.');
+        return;
+      }
+      
+      axios.get(specSource, { 
+        timeout: 30000, 
+        httpsAgent: new https.Agent({ rejectUnauthorized: false }),
+        headers: {
+          'Accept': 'application/json',
+          'User-Agent': 'ScanPower-MCP-Server/1.0.0'
+        }
+      })
+        .then((resp) => {
+          try {
+            let data = resp.data;
+            
+            // If response is a string, try to parse it as JSON
+            if (typeof data === 'string') {
+              // Try to fix common JSON issues like trailing commas
+              data = data.replace(/,(\s*[}\]])/g, '$1');
+              this.openApi = JSON.parse(data);
+            } else {
+              this.openApi = data;
+            }
+            
+            generateFromCurrentOpenApi();
+            console.error('OpenAPI spec loaded from URL. Tools generated.');
+          } catch (e) {
+            console.error('Failed to parse OpenAPI spec from URL. Dynamic tools disabled.', e);
+            this.openApi = null;
+            this.generatedTools = [];
+            this.operationMap.clear();
+          }
+        })
+        .catch((e) => {
+          console.error('Failed to fetch OpenAPI spec from URL. Dynamic tools disabled.', e);
+          this.openApi = null;
+          this.generatedTools = [];
+          this.operationMap.clear();
+        });
+      return;
+    }
+
+    // Load from local filesystem synchronously (existing behavior)
     try {
-      const raw = fs.readFileSync(defaultSpecPath, 'utf-8');
+      const raw = fs.readFileSync(specSource, 'utf-8');
       this.openApi = JSON.parse(raw);
+      generateFromCurrentOpenApi();
     } catch (e) {
       console.error('Failed to load OpenAPI spec. Dynamic tools disabled.', e);
       this.openApi = null;
@@ -382,96 +536,6 @@ class ScanPowerMCPServer {
       this.operationMap.clear();
       return;
     }
-
-    const tools: Tool[] = [];
-    const opMap: Map<string, any> = new Map();
-    const paths = this.openApi.paths || {};
-    const methods = ['get', 'post', 'put', 'delete', 'patch'];
-
-    for (const pathKey of Object.keys(paths)) {
-      const pathItem = paths[pathKey] || {};
-      for (const m of methods) {
-        const op = pathItem[m];
-        if (!op) continue;
-        const operationId = op.operationId || `${m}_${pathKey.replace(/[^a-zA-Z0-9]+/g, '_')}`;
-        const description = op.summary || op.description || `${m.toUpperCase()} ${pathKey}`;
-
-        // Collect parameters and resolve references
-        const rawParams = [...(pathItem.parameters || []), ...(op.parameters || [])];
-        const params = rawParams.map((p: any) => {
-          if (p.$ref) {
-            // Resolve reference
-            const refPath = p.$ref.replace('#/', '').split('/');
-            let resolved = this.openApi;
-            for (const part of refPath) {
-              resolved = resolved?.[part];
-            }
-            return resolved || p;
-          }
-          return p;
-        });
-        const pathParams = params.filter((p: any) => p.in === 'path').map((p: any) => p.name);
-        const queryParams = params.filter((p: any) => p.in === 'query').map((p: any) => p.name);
-        const headerParams = params.filter((p: any) => p.in === 'header').map((p: any) => p.name);
-        const paramDefsByIn: any = { path: [], query: [], header: [] };
-        for (const p of params) {
-          if (p.in === 'path') paramDefsByIn.path.push(p);
-          if (p.in === 'query') paramDefsByIn.query.push(p);
-          if (p.in === 'header') paramDefsByIn.header.push(p);
-        }
-
-        const inputSchemaProps: any = {};
-        for (const p of pathParams) inputSchemaProps[p.replace(/[-.]/g, '_')] = { type: 'string' };
-        for (const q of queryParams) inputSchemaProps[q.replace(/[-.]/g, '_')] = { type: ['string', 'number', 'boolean', 'array', 'object'] };
-        for (const h of headerParams) inputSchemaProps[h.replace(/[-.]/g, '_')] = { type: 'string' };
-
-        // Request body support (JSON only)
-        let requiresBody = false;
-        let bodySchema: any = undefined;
-        if (op.requestBody && op.requestBody.content) {
-          const contentTypes = Object.keys(op.requestBody.content);
-          if (contentTypes.includes('application/json')) {
-            requiresBody = true;
-            bodySchema = op.requestBody.content['application/json']?.schema;
-          }
-        }
-        if (requiresBody) {
-          inputSchemaProps['body'] = { type: ['object', 'array', 'string', 'number', 'boolean', 'null'] };
-        }
-
-        // Add api_token for auth convenience
-        inputSchemaProps['api_token'] = { type: 'string', description: 'Optional token for bearer/apiKey auth' };
-
-        const required: string[] = [];
-        // Path params are typically required
-        for (const p of pathParams) required.push(p.replace(/[-.]/g, '_'));
-
-        tools.push({
-          name: operationId,
-          description,
-          inputSchema: {
-            type: 'object',
-            properties: inputSchemaProps,
-            required: required.length ? required : undefined,
-          },
-        });
-
-        opMap.set(operationId, {
-          method: m.toUpperCase(),
-          path: pathKey,
-          pathParams,
-          queryParams,
-          headerParams,
-          paramDefs: paramDefsByIn,
-          security: op.security || this.openApi.security || [],
-          bodyRequired: requiresBody,
-          bodySchema,
-        });
-      }
-    }
-
-    this.generatedTools = tools;
-    this.operationMap = opMap;
   }
 
   async run(): Promise<void> {
