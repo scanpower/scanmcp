@@ -178,6 +178,7 @@ class ScanPowerMCPServer {
   private openApi: any | null = null;
   private operationMap: Map<string, any> = new Map();
   private generatedTools: Tool[] = [];
+  private isReady: boolean = false;
 
   constructor() {
     const scanPowerConfig: ScanPowerConfig = {
@@ -203,25 +204,45 @@ class ScanPowerMCPServer {
       }
     );
 
-    // Attempt to load OpenAPI spec and generate tools
-    this.loadOpenApiAndGenerateTools();
-
     this.setupHandlers();
   }
 
   private setupHandlers(): void {
     this.server.setRequestHandler(ListToolsRequestSchema, async () => {
+      if (!this.isReady) {
+        return {
+          tools: [],
+        };
+      }
       return {
         tools: this.generatedTools,
       };
     });
 
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+      if (!this.isReady) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: 'Server is not ready yet. Please wait for OpenAPI spec to load.',
+            },
+          ],
+          isError: true,
+        };
+      }
+
       const { name, arguments: args } = request.params;
       const typedArgs = args as Record<string, any> | undefined;
 
+      let urlPath: string = '';
+      let queryParams: Record<string, any> = {};
+      let headers: Record<string, any> = {};
+      let data: any = undefined;
+      let op: any = null;
+
       try {
-        const op = this.operationMap.get(name);
+        op = this.operationMap.get(name);
         if (!op) {
           throw new Error(`Unknown tool: ${name}`);
         }
@@ -229,7 +250,7 @@ class ScanPowerMCPServer {
         const argsOrEmpty = typedArgs || {};
 
         // Build URL with path params
-        let urlPath: string = op.path;
+        urlPath = op.path;
         const missingInputs: Array<{ name: string; description?: string; in?: string; schema?: any }> = [];
         if (op.pathParams && op.pathParams.length > 0) {
           for (const p of op.pathParams) {
@@ -245,7 +266,7 @@ class ScanPowerMCPServer {
         }
 
         // Query params
-        const queryParams: Record<string, any> = {};
+        queryParams = {};
         if (op.queryParams && op.queryParams.length > 0) {
           for (const q of op.queryParams) {
             const val = argsOrEmpty[q] ?? argsOrEmpty[q.replace(/[-.]/g, '_')];
@@ -260,7 +281,7 @@ class ScanPowerMCPServer {
         }
 
         // Headers (from parameters only; security handled below)
-        const headers: Record<string, any> = {};
+        headers = {};
         if (op.headerParams && op.headerParams.length > 0) {
           for (const h of op.headerParams) {
             let val = argsOrEmpty[h] ?? argsOrEmpty[h.replace(/[-.]/g, '_')];
@@ -290,7 +311,7 @@ class ScanPowerMCPServer {
         }
 
         // Request body
-        const data = argsOrEmpty.body !== undefined ? argsOrEmpty.body : undefined;
+        data = argsOrEmpty.body !== undefined ? argsOrEmpty.body : undefined;
         if (op.bodyRequired && data === undefined) {
           missingInputs.push({ name: 'body', description: 'Request body', in: 'body', schema: op.bodySchema || { type: 'object' } });
         }
@@ -357,11 +378,24 @@ class ScanPowerMCPServer {
               ],
             };
       } catch (error) {
+        // Build full request details for debugging
+        const requestDetails = {
+          toolName: name,
+          arguments: typedArgs,
+          axiosConfig: {
+            method: op.method,
+            url: urlPath,
+            params: Object.keys(queryParams).length ? queryParams : undefined,
+            data,
+            headers,
+          },
+        };  
+        console.error('Request Details:', JSON.stringify(requestDetails, null, 2));
         return {
           content: [
             {
               type: 'text',
-              text: `Error: ${error instanceof Error ? error.message : String(error)}`,
+              text: `Error: ${error instanceof Error ? error.message : String(error)}\n\nFull Request Details:\n${JSON.stringify(requestDetails, null, 2)}`,
             },
           ],
           isError: true,
@@ -370,7 +404,7 @@ class ScanPowerMCPServer {
     });
   }
 
-  private loadOpenApiAndGenerateTools(): void {
+  private async loadOpenApiAndGenerateTools(): Promise<void> {
     const specSource = process.env.SCANPOWER_OPENAPI_SPEC;
 
     const generateFromCurrentOpenApi = () => {
@@ -380,12 +414,18 @@ class ScanPowerMCPServer {
         return;
       }
 
+      // Override server URLs with configured base URL
+      if (this.apiClient['config'].baseUrl) {
+        this.openApi.servers = [{ url: this.apiClient['config'].baseUrl }];
+      }
+
       const tools: Tool[] = [];
       const opMap: Map<string, any> = new Map();
       const paths = this.openApi.paths || {};
       const methods = ['get', 'post', 'put', 'delete', 'patch'];
 
       for (const pathKey of Object.keys(paths)) {
+        //console.error('pathKey', pathKey);
         const pathItem = paths[pathKey] || {};
         for (const m of methods) {
           const op = pathItem[m];
@@ -468,11 +508,13 @@ class ScanPowerMCPServer {
       }
 
       this.generatedTools = tools;
+      //console.error('generatedTools', this.generatedTools);
       this.operationMap = opMap;
+      this.isReady = true;
     };
 
     // Check if specSource is a URL (http/https) or blob URL
-    if (/^https?:\/\//i.test(specSource) || /^blob:https?:\/\//i.test(specSource)) {
+    if (specSource && (/^https?:\/\//i.test(specSource) || /^blob:https?:\/\//i.test(specSource))) {
       // Load asynchronously from URL
       console.error(`Loading OpenAPI spec from URL: ${specSource}`);
       this.openApi = null;
@@ -482,63 +524,56 @@ class ScanPowerMCPServer {
       // Skip blob URLs as they can't be fetched via HTTP
       if (/^blob:https?:\/\//i.test(specSource)) {
         console.error('Blob URLs cannot be fetched via HTTP. Please provide a direct HTTP/HTTPS URL to the OpenAPI spec.');
+        this.isReady = true; // Set ready even if no spec
         return;
       }
       
-      axios.get(specSource, { 
-        timeout: 30000, 
-        httpsAgent: new https.Agent({ rejectUnauthorized: false }),
-        headers: {
-          'Accept': 'application/json',
-          'User-Agent': 'ScanPower-MCP-Server/1.0.0'
-        }
-      })
-        .then((resp) => {
-          try {
-            let data = resp.data;
-            
-            // If response is a string, try to parse it as JSON
-            if (typeof data === 'string') {
-              // Try to fix common JSON issues like trailing commas
-              data = data.replace(/,(\s*[}\]])/g, '$1');
-              this.openApi = JSON.parse(data);
-            } else {
-              this.openApi = data;
-            }
-            
-            generateFromCurrentOpenApi();
-            console.error('OpenAPI spec loaded from URL. Tools generated.');
-          } catch (e) {
-            console.error('Failed to parse OpenAPI spec from URL. Dynamic tools disabled.', e);
-            this.openApi = null;
-            this.generatedTools = [];
-            this.operationMap.clear();
+      try {
+        const resp = await axios.get(specSource, { 
+          timeout: 30000, 
+          httpsAgent: new https.Agent({ rejectUnauthorized: false }),
+          headers: {
+            'Accept': 'application/json',
+            'User-Agent': 'ScanPower-MCP-Server/1.0.0'
           }
-        })
-        .catch((e) => {
-          console.error('Failed to fetch OpenAPI spec from URL. Dynamic tools disabled.', e);
+        });
+        
+        try {
+          let data = resp.data;
+          
+          // If response is a string, try to parse it as JSON
+          if (typeof data === 'string') {
+            // Try to fix common JSON issues like trailing commas
+            data = data.replace(/,(\s*[}\]])/g, '$1');
+            this.openApi = JSON.parse(data);
+          } else {
+            this.openApi = data;
+          }
+          
+          generateFromCurrentOpenApi();
+          console.error('OpenAPI spec loaded from URL. Tools generated.');
+        } catch (e) {
+          console.error('Failed to parse OpenAPI spec from URL. Dynamic tools disabled.', e);
           this.openApi = null;
           this.generatedTools = [];
           this.operationMap.clear();
-        });
-      return;
-    }
-
-    // Load from local filesystem synchronously (existing behavior)
-    try {
-      const raw = fs.readFileSync(specSource, 'utf-8');
-      this.openApi = JSON.parse(raw);
-      generateFromCurrentOpenApi();
-    } catch (e) {
-      console.error('Failed to load OpenAPI spec. Dynamic tools disabled.', e);
-      this.openApi = null;
-      this.generatedTools = [];
-      this.operationMap.clear();
+          this.isReady = true; // Set ready even if no spec
+        }
+      } catch (e) {
+        console.error('Failed to fetch OpenAPI spec from URL. Dynamic tools disabled.', e);
+        this.openApi = null;
+        this.generatedTools = [];
+        this.operationMap.clear();
+        this.isReady = true; // Set ready even if no spec
+      }
       return;
     }
   }
 
   async run(): Promise<void> {
+    // Load OpenAPI spec and generate tools first
+    await this.loadOpenApiAndGenerateTools();
+    
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
     console.error('ScanPower MCP server running on stdio');
