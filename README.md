@@ -352,7 +352,7 @@ npm run watch
 
 ## API Reference
 
-This MCP server is based on the ScanPower API v2.0 specification. For detailed information about the underlying API endpoints and their parameters, refer to the [ScanPower API documentation](https://www.scanpower.com).
+This MCP server is based on the ScanPower API v2.0 specification. For detailed information about the underlying API endpoints and their parameters, refer to the [ScanPower API documentation](https://unity.scanpower.com/docs/api/index.html).
 
 ### Authentication
 
