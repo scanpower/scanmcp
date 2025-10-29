@@ -64,10 +64,18 @@ class ScanPowerAPIClient {
         const maskedHeaders: Record<string, any> = { ...(config.headers as any) };
         if (maskedHeaders['Authorization']) {
           const token = String(maskedHeaders['Authorization']);
-          maskedHeaders['Authorization'] = token.replace(/(Bearer\s+)(.+)/i, (_m, p1, p2) => {
-            const tail = p2.slice(-4);
-            return `${p1}***${tail}`;
-          });
+          if (token.toLowerCase().startsWith('basic ')) {
+            maskedHeaders['Authorization'] = 'Basic ***';
+          } else {
+            maskedHeaders['Authorization'] = token.replace(/(Bearer\s+)(.+)/i, (_m, p1, p2) => {
+              const tail = p2.slice(-4);
+              return `${p1}***${tail}`;
+            });
+          }
+        }
+        // Also log if auth option is set (axios will convert this to Authorization header)
+        if (config.auth) {
+          console.error('[HTTP REQUEST] Auth option present - username:', config.auth.username ? '***' : 'missing');
         }
         if (maskedHeaders['X-Access-Token']) {
           const t = String(maskedHeaders['X-Access-Token']);
@@ -110,6 +118,10 @@ class ScanPowerAPIClient {
 
   setApiToken(token: string): void {
     this.apiToken = token;
+  }
+
+  setProxyUserId(proxyUserId: string | undefined): void {
+    this.config.proxyUserId = proxyUserId;
   }
 
   async authenticate(): Promise<void> {
@@ -242,6 +254,22 @@ class ScanPowerMCPServer {
       let op: any = null;
 
       try {
+        // If a proxy_user_id is provided, set it immediately so subsequent calls use it
+        if (typedArgs && typeof typedArgs.proxy_user_id === 'string' && typedArgs.proxy_user_id.trim().length > 0) {
+          this.apiClient.setProxyUserId(typedArgs.proxy_user_id.trim());
+          console.error('[AUTH] Proxy user set to:', typedArgs.proxy_user_id.trim());
+          // If the intent was just to set proxy, acknowledge and return early with confirmation
+          if (name === 'getProxyUsers') {
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: `✅ Proxy user successfully set to: ${typedArgs.proxy_user_id.trim()}\n\nThis proxy user will be used for all subsequent API calls until changed.`,
+                },
+              ],
+            };
+          }
+        }
         op = this.operationMap.get(name);
         if (!op) {
           throw new Error(`Unknown tool: ${name}`);
@@ -250,6 +278,10 @@ class ScanPowerMCPServer {
         const argsOrEmpty = typedArgs || {};
 
         // Build URL with path params
+        // Use stored flag indicating if original path had trailing slash
+        const originalPathHasTrailingSlash = op.pathHasTrailingSlash === true;
+        console.error('originalPathHasTrailingSlash', originalPathHasTrailingSlash);
+        console.error('op.path', op.path);
         urlPath = op.path;
         const missingInputs: Array<{ name: string; description?: string; in?: string; schema?: any }> = [];
         if (op.pathParams && op.pathParams.length > 0) {
@@ -263,6 +295,10 @@ class ScanPowerMCPServer {
               urlPath = urlPath.replace(`{${p}}`, encodeURIComponent(String(v)));
             }
           }
+        }
+        // Restore trailing slash if it was present in the original path from OpenAPI spec
+        if (originalPathHasTrailingSlash && !urlPath.endsWith('/')) {
+          urlPath = urlPath + '/';
         }
 
         // Query params
@@ -328,31 +364,61 @@ class ScanPowerMCPServer {
 
         // Apply per-operation security based on OpenAPI spec
         const security = op.security as any[] | undefined;
+        let useBasicAuth = false;
         if (security && security.length > 0) {
           // Security is an array of requirement objects; treat as OR, pick first applicable
           const requirement = security[0];
+          
+          // First, check if any scheme requires basic_auth (priority check)
           for (const schemeName of Object.keys(requirement)) {
             const scheme = this.openApi?.components?.securitySchemes?.[schemeName];
             if (!scheme) continue;
             const type = String(scheme.type || '').toLowerCase();
-            if (type === 'http') {
+            // Check for basic auth in http, https, or any scheme that specifies 'basic'
+            if (type === 'http' || type === 'https') {
               const httpScheme = String(scheme.scheme || '').toLowerCase();
-              if (httpScheme === 'bearer') {
-                const token = argsOrEmpty.api_token || this.apiClient['apiToken'];
-                if (!token) {
-                  // Attempt authenticate to obtain token
-                  await this.apiClient.authenticate();
+              if (httpScheme === 'basic') {
+                useBasicAuth = true;
+                break;
+              }
+            }
+            // Also check if scheme name or other properties indicate basic auth
+            const schemeNameLower = String(schemeName || '').toLowerCase();
+            if (schemeNameLower.includes('basic') || schemeNameLower.includes('basic_auth')) {
+              useBasicAuth = true;
+              break;
+            }
+          }
+          
+          // If basic auth is required, explicitly remove Authorization header
+          if (useBasicAuth) {
+            delete headers['Authorization'];
+            console.error('[AUTH] Using basic_auth for operation:', name, 'path:', urlPath);
+          } else {
+            // If basic auth is not required, check for bearer token
+            for (const schemeName of Object.keys(requirement)) {
+              const scheme = this.openApi?.components?.securitySchemes?.[schemeName];
+              if (!scheme) continue;
+              const type = String(scheme.type || '').toLowerCase();
+              // Check for bearer auth in http, https, or any scheme that specifies 'bearer'
+              if (type === 'http' || type === 'https') {
+                const httpScheme = String(scheme.scheme || '').toLowerCase();
+                if (httpScheme === 'bearer') {
+                  const token = argsOrEmpty.api_token || this.apiClient['apiToken'];
+                  if (!token) {
+                    // Attempt authenticate to obtain token
+                    await this.apiClient.authenticate();
+                  }
+                  const finalToken = argsOrEmpty.api_token || this.apiClient['apiToken'];
+                  if (!finalToken) throw new Error('Missing bearer token (api_token)');
+                  headers['Authorization'] = `Bearer ${finalToken}`;
+                  break; // Only need one bearer token
                 }
-                const finalToken = argsOrEmpty.api_token || this.apiClient['apiToken'];
-                if (!finalToken) throw new Error('Missing bearer token (api_token)');
-                headers['Authorization'] = `Bearer ${finalToken}`;
-              } else if (httpScheme === 'basic') {
-                // Use basic auth via axios option
-                op.useBasicAuth = true;
               }
             }
           }
         }
+        op.useBasicAuth = useBasicAuth;
 
         const axiosConfig: any = {
           method: op.method,
@@ -362,21 +428,64 @@ class ScanPowerMCPServer {
           headers,
         };
         if (op.useBasicAuth === true) {
+          const username = this.apiClient['config'].username;
+          const password = this.apiClient['config'].password;
+          if (!username || !password) {
+            throw new Error('SCANPOWER_USERNAME and SCANPOWER_PASSWORD are required for basic authentication');
+          }
           axiosConfig.auth = {
-            username: this.apiClient['config'].username,
-            password: this.apiClient['config'].password,
+            username,
+            password,
           };
+          console.error('[AUTH] Basic auth credentials configured for:', urlPath, 'username:', username);
         }
 
         const response = await this.apiClient['client'].request(axiosConfig);
+
+        // Special behavior: for getProxyUsers, return formatted list with selection instructions
+        if (name === 'getProxyUsers') {
+          const dataOut = response.data;
+          let users: Array<{ id: string; name?: string }> = [];
+          if (Array.isArray(dataOut)) {
+            users = (dataOut as Array<Record<string, any>>)
+              .map((u: Record<string, any>) => ({ id: String(u?.id ?? ''), name: u?.name ? String(u.name) : undefined }))
+              .filter((u: { id: string; name?: string }) => !!u.id);
+          } else if (dataOut && Array.isArray((dataOut as any).items)) {
+            users = ((dataOut as any).items as Array<Record<string, any>>)
+              .map((u: Record<string, any>) => ({ id: String(u?.id ?? ''), name: u?.name ? String(u.name) : undefined }))
+              .filter((u: { id: string; name?: string }) => !!u.id);
+          }
+
+          if (users.length > 0) {
+            // Format the response to include structured data and instructions
+            const usersList = users.map((u, idx) => `${idx + 1}. ${u.name || 'Unnamed'} (ID: ${u.id})`).join('\n');
+            const responseText = `Available Proxy Users:\n\n${usersList}\n\nTo set a proxy user for subsequent API calls, call getProxyUsers again with the 'proxy_user_id' parameter set to one of the IDs above.\n\nExample: Call getProxyUsers with arguments: {"proxy_user_id": "${users[0].id}"}`;
+            
+            // Also include structured JSON for parsing
             return {
               content: [
                 {
                   type: 'text',
-              text: JSON.stringify(response.data, null, 2),
+                  text: responseText,
+                },
+                {
+                  type: 'text',
+                  text: `\n\n[STRUCTURED_DATA]\n${JSON.stringify({ proxyUsers: users, selected: null }, null, 2)}\n[/STRUCTURED_DATA]`,
                 },
               ],
             };
+          }
+          // If no users found, fall through to return raw data
+        }
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(response.data, null, 2),
+            },
+          ],
+        };
       } catch (error) {
         // Build full request details for debugging
         const requestDetails = {
@@ -423,6 +532,11 @@ class ScanPowerMCPServer {
       const opMap: Map<string, any> = new Map();
       const paths = this.openApi.paths || {};
       const methods = ['get', 'post', 'put', 'delete', 'patch'];
+
+      // Debug: Check if /account/ exists in paths object
+      if (paths['/account/'] || paths['/account']) {
+        console.error('[DEBUG] Path /account/ exists:', !!paths['/account/'], 'Path /account exists:', !!paths['/account']);
+      }
 
       for (const pathKey of Object.keys(paths)) {
         //console.error('pathKey', pathKey);
@@ -493,9 +607,27 @@ class ScanPowerMCPServer {
             },
           });
 
+          // Store whether the original path has a trailing slash
+          // Also check the paths object directly to see if /account/ exists separately
+          let pathHasTrailingSlash = pathKey && pathKey.endsWith('/');
+          
+          // Special case: if path is /account but the API requires /account/
+          // Check if this operation is known to need trailing slash (getProxyUsers)
+          if (!pathHasTrailingSlash && pathKey === '/account' && operationId === 'getProxyUsers') {
+            // Check if /account/ also exists in paths (it shouldn't if we're in /account branch)
+            // But if the API requires /account/, we should add it
+            pathHasTrailingSlash = true; // Force trailing slash for getProxyUsers
+            console.error('[TOOLS] Forcing trailing slash for getProxyUsers - path will be /account/');
+          }
+          
+          // Debug: verify trailing slash handling for specific operations
+          if (operationId === 'getProxyUsers') {
+            console.error('[TOOLS] getProxyUsers path:', pathKey, 'pathHasTrailingSlash:', pathHasTrailingSlash);
+          }
           opMap.set(operationId, {
             method: m.toUpperCase(),
-            path: pathKey,
+            path: pathKey, // Preserve original path including trailing slash
+            pathHasTrailingSlash, // Store flag to restore trailing slash later
             pathParams,
             queryParams,
             headerParams,
